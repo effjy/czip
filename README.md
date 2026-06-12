@@ -1,11 +1,8 @@
 # czip
 
-[![Release](https://img.shields.io/github/v/release/effjy/czip?sort=semver)](https://github.com/effjy/czip/releases)
-[![License](https://img.shields.io/github/license/effjy/czip)](https://github.com/effjy/czip/blob/main/LICENSE)
 [![Language](https://img.shields.io/badge/language-C-blue.svg)](https://github.com/effjy/czip)
 [![Crypto](https://img.shields.io/badge/crypto-XChaCha20--Poly1305-green.svg)](https://doc.libsodium.org/secret-key_cryptography/secretstream)
 [![Compression](https://img.shields.io/badge/compression-zstd-orange.svg)](https://facebook.github.io/zstd/)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)](https://github.com/effjy/czip)
 
 **czip** compresses **and** authenticated-encrypts files or directories in a single
 step. It is the first archiver to combine [zstd](https://facebook.github.io/zstd/)
