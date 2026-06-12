@@ -1,7 +1,7 @@
 # czip
 
 [![Language](https://img.shields.io/badge/language-C-blue.svg)](https://github.com/effjy/czip)
-[![Crypto](https://img.shields.io/badge/crypto-ChaCha20--Poly1305-green.svg)](https://doc.libsodium.org/secret-key_cryptography/aead)
+[![Crypto](https://img.shields.io/badge/crypto-XChaCha20--Poly1305-green.svg)](https://doc.libsodium.org/secret-key_cryptography/aead)
 [![Compression](https://img.shields.io/badge/compression-zstd-orange.svg)](https://facebook.github.io/zstd/)
 
 **czip** compresses **and** authenticated-encrypts files or directories in a single
