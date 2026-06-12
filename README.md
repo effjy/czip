@@ -1,19 +1,24 @@
 # czip
 
+[![Release](https://img.shields.io/github/v/release/effjy/czip?sort=semver)](https://github.com/effjy/czip/releases)
+[![License](https://img.shields.io/github/license/effjy/czip)](https://github.com/effjy/czip/blob/main/LICENSE)
 [![Language](https://img.shields.io/badge/language-C-blue.svg)](https://github.com/effjy/czip)
-[![Crypto](https://img.shields.io/badge/crypto-XChaCha20--Poly1305-green.svg)](https://doc.libsodium.org/secret-key_cryptography/aead)
+[![Crypto](https://img.shields.io/badge/crypto-XChaCha20--Poly1305-green.svg)](https://doc.libsodium.org/secret-key_cryptography/secretstream)
 [![Compression](https://img.shields.io/badge/compression-zstd-orange.svg)](https://facebook.github.io/zstd/)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)](https://github.com/effjy/czip)
 
 **czip** compresses **and** authenticated-encrypts files or directories in a single
 step. It is the first archiver to combine [zstd](https://facebook.github.io/zstd/)
-multithreaded compression with **ChaCha20-Poly1305** / **XChaCha20-Poly1305**
-authenticated encryption.
+multithreaded compression with **XChaCha20-Poly1305** authenticated encryption.
 
 - 🗜️ **Compression** — zstd, with worker threads scaled to your CPU core count
   automatically (just like 7-Zip).
-- 🔐 **Encryption** — ChaCha20-Poly1305 (IETF) by default, or XChaCha20-Poly1305 with
-  `--xchacha` for a 24-byte random nonce (safer when you produce a huge number of
-  archives).
+- 🌊 **Streaming** — the archive is walked, compressed, encrypted and written
+  chunk by chunk. Memory use stays flat (a few hundred KB) no matter how large the
+  input, so terabyte files are no problem. Live progress is shown on stderr.
+- 🔐 **Encryption** — XChaCha20-Poly1305 via libsodium's *secretstream*, which binds
+  the chunks into a single ordered, tamper-evident sequence (no chunk can be dropped,
+  reordered or truncated undetected).
 - 🔑 **Key derivation** — your password is turned into a key with Argon2id, a
   memory-hard function that resists brute force.
 - ✂️ **Splitting** — break the output into equal-sized parts you choose, in MB.
@@ -33,7 +38,7 @@ ciphertext is indistinguishable from random noise and cannot be compressed after
   - [Compress a file](#compress-a-file)
   - [Compress a directory](#compress-a-directory)
   - [Extract](#extract)
-  - [Choosing the cipher](#choosing-the-cipher)
+  - [Cipher](#cipher)
   - [Compression level](#compression-level)
   - [Threads](#threads)
   - [Splitting into parts](#splitting-into-parts)
@@ -43,7 +48,7 @@ ciphertext is indistinguishable from random noise and cannot be compressed after
 - [Command reference](#command-reference)
 - [How it works](#how-it-works)
 - [Security notes](#security-notes)
-- [Container format](#container-format-v1)
+- [Container format](#container-format-v2)
 
 ---
 
@@ -98,7 +103,7 @@ Verify:
 
 ```sh
 czip --version
-# czip 1.0.5
+# czip 1.1.0
 ```
 
 ## Uninstall
@@ -126,10 +131,13 @@ czip -p 'my secret pw' report.pdf
 Output:
 
 ```
+czip: compressing 100.0% (4.20 MB / 4.20 MB)
 czip: wrote report.pdf.cz (1.85 MB)
-czip: report.pdf -> report.pdf.cz [ChaCha20-Poly1305]
-czip: before 4.20 MB (4404019 bytes)  after 1.85 MB (1939276 bytes)  ratio 44.0% (saved 56.0%)
+czip: report.pdf -> report.pdf.cz [XChaCha20-Poly1305]
+czip: before 4.20 MB (4404019 bytes)  after 1.85 MB (1939276 bytes)  saved 56.0%
 ```
+
+While it runs, a live progress line is printed to stderr and updated in place.
 
 ### Compress a directory
 
@@ -158,15 +166,13 @@ unverified data:
 czip: decryption failed: wrong password or corrupted/tampered file
 ```
 
-### Choosing the cipher
+### Cipher
 
-Default is **ChaCha20-Poly1305**. Add `--xchacha` for **XChaCha20-Poly1305**, which
-uses a larger 24-byte random nonce — recommended if you generate very large numbers
-of archives with the same password.
-
-```sh
-czip --xchacha -p 'my secret pw' backup/
-```
+czip uses **XChaCha20-Poly1305** via libsodium's *secretstream* construction. The
+24-byte random stream header makes nonce reuse a non-issue, and the data is split
+into authenticated chunks bound into one ordered sequence — a truncated, reordered or
+modified stream is always detected. There is nothing to choose; the legacy
+`--xchacha` flag is still accepted but has no effect.
 
 ### Compression level
 
@@ -258,7 +264,7 @@ czip -d -q -p pw backup.cz     # silent extract
 | --- | --- |
 | `-p`, `--password <pw>` | Password (required, or set `CZIP_PASSWORD`). |
 | `-d`, `--decompress` | Extract mode. |
-| `--xchacha` | Use XChaCha20-Poly1305 (24-byte nonce) instead of ChaCha20-Poly1305. |
+| `--xchacha` | Deprecated no-op (XChaCha20-Poly1305 is always used); accepted for compatibility. |
 | `-l`, `--level <1-22>` | zstd compression level (default `19`). |
 | `-T`, `--threads <n>` | Worker threads (default: all CPU cores). |
 | `--split <MB>` | Split output into parts of `<MB>` megabytes each. |
@@ -271,10 +277,13 @@ czip -d -q -p pw backup.cz     # silent extract
 
 ## How it works
 
+Everything below is **streamed** in 256 KB chunks — nothing is ever fully buffered,
+so memory stays flat regardless of input size:
+
 ```
             ┌───────────┐     ┌──────────────┐     ┌────────────────────────┐
-  files/    │  archive  │ --> │ zstd compress│ --> │ ChaCha20/XChaCha20      │ --> .cz
-  directory │ (in-mem)  │     │ (multithread)│     │ Poly1305 AEAD encrypt   │
+  files/    │  archive  │ --> │ zstd compress│ --> │ XChaCha20-Poly1305      │ --> .cz
+  directory │ (streamed)│     │ (multithread)│     │ secretstream (chunked)  │
             └───────────┘     └──────────────┘     └────────────────────────┘
                                                           ▲
                                               Argon2id( your password + salt )
@@ -282,11 +291,12 @@ czip -d -q -p pw backup.cz     # silent extract
 
 ## Security notes
 
-- Each archive embeds the Argon2 **salt**, the AEAD **nonce**, and the KDF
+- Each archive embeds the Argon2 **salt**, the secretstream **header**, and the KDF
   parameters in an authenticated header, so the file is self-describing and
   tamper-evident.
-- The header is authenticated as associated data; any modification to the file fails
-  the Poly1305 tag check and is rejected.
+- The header is bound into the first chunk as associated data, and every chunk carries
+  its own Poly1305 tag; any modification, truncation or reordering of the stream fails
+  authentication and is rejected.
 - Keys are wiped from memory with `sodium_memzero` after use.
 - Extraction rejects absolute paths and `..` components, preventing zip-slip path
   traversal.
@@ -294,19 +304,23 @@ czip -d -q -p pw backup.cz     # silent extract
   is absolute or escapes the archive (`..`) is skipped with a warning, so a hostile
   archive cannot redirect writes outside the destination directory.
 
-> **Note:** czip currently holds the archive in memory during processing, so a single
-> archive must fit in available RAM. Streaming support for very large files is planned.
+> **Note:** czip streams everything end to end, so memory use stays flat (a few
+> hundred KB) no matter how large the input — a single terabyte file compresses with
+> the same footprint as a single kilobyte one.
 
-## Container format (v1)
+## Container format (v2)
 
 ```
 "CZIP" | fmt(1) | version major/minor/patch(3) | algo(1)
-opslimit(8) | memlimit(8) | salt(16) | nonce_len(1) | nonce(12 or 24)
-ciphertext_len(8) | ciphertext (zstd-compressed archive + 16-byte Poly1305 tag)
+opslimit(8) | memlimit(8) | salt(16) | secretstream_header(24)
+then a sequence of chunks:  chunk_len(4) | chunk  (each = ciphertext + 17-byte tag)
 ```
 
-The header is authenticated as associated data; the ciphertext is the AEAD-sealed,
-zstd-compressed archive stream.
+The fixed header (everything up to and including the secretstream header) is bound
+into the first chunk as associated data. Each chunk is one piece of the
+zstd-compressed archive, sealed with libsodium's secretstream; the last chunk carries
+the FINAL tag, so truncation is detected. Split parts (`.001`, `.002`, …) are simply
+this byte stream cut at fixed offsets and concatenated back on extraction.
 
 ---
 
