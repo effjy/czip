@@ -1,11 +1,15 @@
 /*
- * czip 1.0.5  —  compress + authenticated-encrypt files and directories.
+ * czip 1.1.0  —  compress + authenticated-encrypt files and directories.
  *
  * Pipeline:  plaintext archive  ->  zstd (multithreaded)  ->  AEAD encrypt
  *   - Compression : zstd, worker threads scaled to the CPU count (like 7-Zip).
- *   - Encryption  : ChaCha20-Poly1305 (IETF) by default,
- *                   XChaCha20-Poly1305 with --xchacha (bigger nonce, safer).
+ *   - Encryption  : XChaCha20-Poly1305 via libsodium's "secretstream", which
+ *                   chunks the data into an authenticated, ordered sequence.
  *   - Key         : derived from a password with Argon2id (libsodium pwhash).
+ *
+ * Everything is streamed: the archive is built, compressed, encrypted and
+ * written chunk by chunk, so memory use stays flat (a few hundred KB) even for
+ * terabyte-scale inputs. Progress is reported to stderr as it runs.
  *
  * Compress-then-encrypt is intentional: ciphertext is indistinguishable from
  * random and therefore cannot be compressed, so compression must come first.
@@ -25,21 +29,24 @@
 #include <sys/types.h>
 #include <errno.h>
 #include <limits.h>
+#include <time.h>
 
 #include <sodium.h>
 #include <zstd.h>
 
 #define CZIP_VER_MAJOR 1
-#define CZIP_VER_MINOR 0
-#define CZIP_VER_PATCH 5
-#define CZIP_VERSION_STR "1.0.5"
+#define CZIP_VER_MINOR 1
+#define CZIP_VER_PATCH 0
+#define CZIP_VERSION_STR "1.1.0"
 
 /* On-disk container header. */
 static const unsigned char CZIP_MAGIC[4] = { 'C', 'Z', 'I', 'P' };
-#define CZIP_FORMAT 1                 /* container format version */
+#define CZIP_FORMAT 2                 /* container format version (2 = streamed) */
 
-#define ALG_CHACHA   0                /* crypto_aead_chacha20poly1305_ietf  */
-#define ALG_XCHACHA  1                /* crypto_aead_xchacha20poly1305_ietf */
+#define ALG_XCHACHA  1                /* secretstream is XChaCha20-Poly1305 based */
+
+/* Target size of one plaintext-compressed chunk before it is sealed. */
+#define CZIP_CHUNK (256 * 1024)
 
 /* Archive entry types (plaintext stream, before compression). */
 #define ENT_FILE 'f'
@@ -102,17 +109,15 @@ static void buf_append(Buf *b, const void *src, size_t n) {
 
 static void buf_u8(Buf *b, uint8_t v)  { buf_append(b, &v, 1); }
 
-static void buf_u32(Buf *b, uint32_t v) {
-    unsigned char t[4] = { v, v >> 8, v >> 16, v >> 24 };
-    buf_append(b, t, 4);
-}
-
 static void buf_u64(Buf *b, uint64_t v) {
     unsigned char t[8];
     for (int i = 0; i < 8; i++) t[i] = (unsigned char)(v >> (8 * i));
     buf_append(b, t, 8);
 }
 
+static void wr_u32(unsigned char *p, uint32_t v) {
+    p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
+}
 static uint32_t rd_u32(const unsigned char *p) {
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
            (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
@@ -123,79 +128,23 @@ static uint64_t rd_u64(const unsigned char *p) {
     return v;
 }
 
-/* ---- file IO ------------------------------------------------------------ */
-
-static int read_whole_file(const char *path, Buf *out) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-    unsigned char tmp[1 << 16];
-    size_t n;
-    while ((n = fread(tmp, 1, sizeof tmp, f)) > 0) buf_append(out, tmp, n);
-    int err = ferror(f);
-    fclose(f);
-    return err ? -1 : 0;
+/* Format a byte count into a human-friendly string, e.g. "3.0 MB". */
+static void human_size(double bytes, char *out, size_t outsz) {
+    const char *u[] = { "B", "KB", "MB", "GB", "TB" };
+    int i = 0;
+    while (bytes >= 1024.0 && i < 4) { bytes /= 1024.0; i++; }
+    if (i == 0) snprintf(out, outsz, "%.0f %s", bytes, u[i]);
+    else        snprintf(out, outsz, "%.2f %s", bytes, u[i]);
 }
 
-static void write_whole_file(const char *path, const void *data, size_t n) {
-    FILE *f = fopen(path, "wb");
-    if (!f) die_errno("cannot open output file");
-    if (n && fwrite(data, 1, n, f) != n) die_errno("write failed");
-    if (fclose(f) != 0) die_errno("close failed");
-}
-
-/* ---- archive building (directory walk) ---------------------------------- */
-
-static void add_path(Buf *ar, const char *fullpath, const char *relpath);
-
-static void add_dir(Buf *ar, const char *fullpath, const char *relpath) {
-    /* Record the directory itself so empty dirs survive. */
-    buf_u8(ar, ENT_DIR);
-    buf_u32(ar, (uint32_t)strlen(relpath));
-    buf_append(ar, relpath, strlen(relpath));
-
-    DIR *d = opendir(fullpath);
-    if (!d) die_errno("cannot open directory");
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-        char fp[PATH_MAX], rp[PATH_MAX];
-        snprintf(fp, sizeof fp, "%s/%s", fullpath, de->d_name);
-        snprintf(rp, sizeof rp, "%s/%s", relpath, de->d_name);
-        add_path(ar, fp, rp);
-    }
-    closedir(d);
-}
-
-static void add_file(Buf *ar, const char *fullpath, const char *relpath) {
-    Buf content; buf_init(&content);
-    if (read_whole_file(fullpath, &content) != 0) die_errno("cannot read file");
-    buf_u8(ar, ENT_FILE);
-    buf_u32(ar, (uint32_t)strlen(relpath));
-    buf_append(ar, relpath, strlen(relpath));
-    buf_u64(ar, content.len);
-    buf_append(ar, content.data, content.len);
-    buf_free(&content);
-}
-
-static void add_link(Buf *ar, const char *fullpath, const char *relpath) {
-    char target[PATH_MAX];
-    ssize_t n = readlink(fullpath, target, sizeof target - 1);
-    if (n < 0) die_errno("cannot read symlink");
-    target[n] = 0;
-    buf_u8(ar, ENT_LINK);
-    buf_u32(ar, (uint32_t)strlen(relpath));
-    buf_append(ar, relpath, strlen(relpath));
-    buf_u64(ar, (uint64_t)n);
-    buf_append(ar, target, (size_t)n);
-}
-
-static void add_path(Buf *ar, const char *fullpath, const char *relpath) {
+static int file_exists(const char *path) {
     struct stat st;
-    if (lstat(fullpath, &st) != 0) die_errno("cannot stat path");
-    if (S_ISLNK(st.st_mode))       add_link(ar, fullpath, relpath);
-    else if (S_ISDIR(st.st_mode))  add_dir(ar, fullpath, relpath);
-    else if (S_ISREG(st.st_mode))  add_file(ar, fullpath, relpath);
-    else fprintf(stderr, "czip: skipping special file %s\n", relpath);
+    return stat(path, &st) == 0;
+}
+
+static long cpu_count(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? n : 1;
 }
 
 /* basename without trailing slash, for the archive root name. */
@@ -205,7 +154,374 @@ static const char *base_name(const char *path) {
     return b;
 }
 
-/* ---- archive extraction ------------------------------------------------- */
+/* ---- key derivation ----------------------------------------------------- */
+
+static void derive_key(unsigned char *key, const char *password,
+                       const unsigned char *salt,
+                       unsigned long long ops, size_t mem) {
+    if (crypto_pwhash(key, crypto_secretstream_xchacha20poly1305_KEYBYTES,
+                      password, strlen(password), salt, ops, mem,
+                      crypto_pwhash_ALG_ARGON2ID13) != 0)
+        die("key derivation failed (out of memory?)");
+}
+
+/* ---- output stream (single file or split parts) ------------------------- */
+
+typedef struct {
+    char      base[PATH_MAX];
+    size_t    split;          /* 0 = single file, else bytes per part */
+    FILE     *f;
+    size_t    part_index;     /* 1-based, only meaningful when split > 0 */
+    size_t    part_written;   /* bytes in the current part */
+    char      cur_name[PATH_MAX + 16];
+    uint64_t  total;          /* total bytes written across all parts */
+} OutStream;
+
+static void out_open_part(OutStream *o) {
+    if (o->split == 0)
+        snprintf(o->cur_name, sizeof o->cur_name, "%s", o->base);
+    else
+        snprintf(o->cur_name, sizeof o->cur_name, "%s.%03zu",
+                 o->base, o->part_index);
+    o->f = fopen(o->cur_name, "wb");
+    if (!o->f) die_errno("cannot open output file");
+    o->part_written = 0;
+}
+
+static void out_open(OutStream *o, const char *base, size_t split) {
+    snprintf(o->base, sizeof o->base, "%s", base);
+    o->split = split;
+    o->part_index = 1;
+    o->total = 0;
+    out_open_part(o);
+}
+
+static void out_write(OutStream *o, const void *buf, size_t n) {
+    const unsigned char *p = buf;
+    if (o->split == 0) {
+        if (n && fwrite(p, 1, n, o->f) != n) die_errno("write failed");
+        o->total += n;
+        return;
+    }
+    while (n) {
+        if (o->part_written == o->split) {
+            if (fclose(o->f) != 0) die_errno("close failed");
+            info("czip: wrote %s (%zu bytes)\n", o->cur_name, o->part_written);
+            o->part_index++;
+            out_open_part(o);
+        }
+        size_t room = o->split - o->part_written;
+        size_t w = n < room ? n : room;
+        if (fwrite(p, 1, w, o->f) != w) die_errno("write failed");
+        o->part_written += w;
+        o->total += w;
+        p += w;
+        n -= w;
+    }
+}
+
+static void out_close(OutStream *o) {
+    if (fclose(o->f) != 0) die_errno("close failed");
+    if (o->split == 0)
+        info("czip: wrote %s (%zu bytes)\n", o->cur_name, (size_t)o->total);
+    else {
+        info("czip: wrote %s (%zu bytes)\n", o->cur_name, o->part_written);
+        info("czip: split into %zu parts\n", o->part_index);
+    }
+}
+
+/* ---- input stream (single file or split parts) -------------------------- */
+
+typedef struct {
+    char   base[PATH_MAX];
+    FILE  *f;
+    size_t part_index;   /* 0 = single file; >=1 = current split part */
+} InStream;
+
+static void in_open(InStream *s, const char *name) {
+    /* If handed a ".001" part directly, fall back to its base name. */
+    size_t n = strlen(name);
+    if (n > 4 && name[n - 4] == '.' &&
+        name[n-3] >= '0' && name[n-3] <= '9' &&
+        name[n-2] >= '0' && name[n-2] <= '9' &&
+        name[n-1] >= '0' && name[n-1] <= '9' &&
+        file_exists(name)) {
+        snprintf(s->base, sizeof s->base, "%.*s", (int)(n - 4), name);
+    } else {
+        snprintf(s->base, sizeof s->base, "%s", name);
+    }
+
+    if (file_exists(s->base)) {
+        s->part_index = 0;
+        s->f = fopen(s->base, "rb");
+        if (!s->f) die_errno("cannot read input");
+        return;
+    }
+    /* Try split parts <base>.001, .002, ... */
+    char part[PATH_MAX + 16];
+    snprintf(part, sizeof part, "%s.001", s->base);
+    if (!file_exists(part)) die("input file not found");
+    s->part_index = 1;
+    s->f = fopen(part, "rb");
+    if (!s->f) die_errno("cannot read part");
+}
+
+/* Read up to n bytes, transparently crossing split-part boundaries.
+ * Returns the number of bytes read; 0 means end of the whole container. */
+static size_t in_read(InStream *s, void *buf, size_t n) {
+    unsigned char *p = buf;
+    size_t got = 0;
+    while (got < n) {
+        size_t r = fread(p + got, 1, n - got, s->f);
+        got += r;
+        if (got == n) break;
+        if (ferror(s->f)) die_errno("read failed");
+        /* hit EOF on this file */
+        if (s->part_index == 0) break;           /* single file: done */
+        fclose(s->f);
+        s->part_index++;
+        char part[PATH_MAX + 16];
+        snprintf(part, sizeof part, "%s.%03zu", s->base, s->part_index);
+        if (!file_exists(part)) break;            /* no more parts: done */
+        s->f = fopen(part, "rb");
+        if (!s->f) die_errno("cannot read part");
+    }
+    return got;
+}
+
+static void in_readfull(InStream *s, void *buf, size_t n) {
+    if (in_read(s, buf, n) != n) die("corrupt or truncated container");
+}
+
+static void in_close(InStream *s) {
+    if (s->f) fclose(s->f);
+    s->f = NULL;
+}
+
+/* ---- progress reporting ------------------------------------------------- */
+
+typedef struct {
+    const char *verb;       /* "compressing" / "extracting" */
+    uint64_t    total;      /* expected total, 0 if unknown */
+    uint64_t    done;
+    uint64_t    last_shown; /* bytes at last redraw */
+    time_t      last_time;
+} Progress;
+
+static void progress_init(Progress *p, const char *verb, uint64_t total) {
+    p->verb = verb;
+    p->total = total;
+    p->done = p->last_shown = 0;
+    p->last_time = 0;
+}
+
+static void progress_draw(Progress *p, int final) {
+    if (g_quiet) return;
+    char hd[32];
+    human_size((double)p->done, hd, sizeof hd);
+    if (p->total) {
+        char ht[32];
+        human_size((double)p->total, ht, sizeof ht);
+        double pct = 100.0 * (double)p->done / (double)p->total;
+        if (pct > 100.0) pct = 100.0;
+        fprintf(stderr, "\rczip: %s %5.1f%% (%s / %s)        ",
+                p->verb, pct, hd, ht);
+    } else {
+        fprintf(stderr, "\rczip: %s %s        ", p->verb, hd);
+    }
+    if (final) fputc('\n', stderr);
+    fflush(stderr);
+}
+
+/* Redraw at most a few times a second, plus once when finishing. */
+static void progress_add(Progress *p, uint64_t n) {
+    p->done += n;
+    if (g_quiet) return;
+    if (p->done - p->last_shown < 1u << 20) return;   /* < 1 MB since last */
+    time_t now = time(NULL);
+    if (now == p->last_time) return;
+    p->last_time = now;
+    p->last_shown = p->done;
+    progress_draw(p, 0);
+}
+
+/* ---- streaming encoder (zstd -> secretstream -> output) ----------------- */
+
+typedef struct {
+    OutStream *out;
+    ZSTD_CCtx *cctx;
+    crypto_secretstream_xchacha20poly1305_state st;
+    unsigned char *zbuf;     /* scratch for zstd output */
+    size_t         zcap;
+    Buf            cbuf;      /* pending compressed bytes awaiting a chunk */
+    unsigned char *ad;        /* header bytes, bound into the first chunk */
+    size_t         adlen;
+    uint64_t       plain_total; /* total plaintext archive bytes emitted */
+    Progress      *prog;
+} Enc;
+
+/* Seal one chunk of compressed plaintext and write it: u32 len + ciphertext. */
+static void enc_seal(Enc *e, const unsigned char *p, size_t n, unsigned char tag) {
+    unsigned char *ct = xmalloc(n + crypto_secretstream_xchacha20poly1305_ABYTES);
+    unsigned long long clen = 0;
+    crypto_secretstream_xchacha20poly1305_push(
+        &e->st, ct, &clen, p, n, e->ad, e->adlen, tag);
+    e->ad = NULL; e->adlen = 0;   /* AD only binds the first chunk */
+    unsigned char lp[4];
+    wr_u32(lp, (uint32_t)clen);
+    out_write(e->out, lp, 4);
+    out_write(e->out, ct, (size_t)clen);
+    free(ct);
+}
+
+/* Accumulate compressed bytes, sealing whole CZIP_CHUNK pieces as they fill. */
+static void enc_add_compressed(Enc *e, const unsigned char *p, size_t n) {
+    buf_append(&e->cbuf, p, n);
+    size_t off = 0;
+    while (e->cbuf.len - off >= CZIP_CHUNK) {
+        enc_seal(e, e->cbuf.data + off, CZIP_CHUNK,
+                 crypto_secretstream_xchacha20poly1305_TAG_MESSAGE);
+        off += CZIP_CHUNK;
+    }
+    if (off) {
+        memmove(e->cbuf.data, e->cbuf.data + off, e->cbuf.len - off);
+        e->cbuf.len -= off;
+    }
+}
+
+/* Feed plaintext archive bytes into the pipeline. */
+static void enc_plain(Enc *e, const void *buf, size_t n) {
+    e->plain_total += n;
+    ZSTD_inBuffer in = { buf, n, 0 };
+    while (in.pos < in.size) {
+        ZSTD_outBuffer out = { e->zbuf, e->zcap, 0 };
+        size_t r = ZSTD_compressStream2(e->cctx, &out, &in, ZSTD_e_continue);
+        if (ZSTD_isError(r)) die(ZSTD_getErrorName(r));
+        if (out.pos) enc_add_compressed(e, e->zbuf, out.pos);
+    }
+}
+
+static void enc_u8(Enc *e, uint8_t v)  { enc_plain(e, &v, 1); }
+static void enc_u32(Enc *e, uint32_t v) {
+    unsigned char t[4]; wr_u32(t, v); enc_plain(e, t, 4);
+}
+static void enc_u64(Enc *e, uint64_t v) {
+    unsigned char t[8];
+    for (int i = 0; i < 8; i++) t[i] = (unsigned char)(v >> (8 * i));
+    enc_plain(e, t, 8);
+}
+
+/* Flush zstd and seal the trailing data with the FINAL tag. */
+static void enc_finish(Enc *e) {
+    for (;;) {
+        ZSTD_inBuffer in = { NULL, 0, 0 };
+        ZSTD_outBuffer out = { e->zbuf, e->zcap, 0 };
+        size_t r = ZSTD_compressStream2(e->cctx, &out, &in, ZSTD_e_end);
+        if (ZSTD_isError(r)) die(ZSTD_getErrorName(r));
+        if (out.pos) enc_add_compressed(e, e->zbuf, out.pos);
+        if (r == 0) break;
+    }
+    enc_seal(e, e->cbuf.data, e->cbuf.len,
+             crypto_secretstream_xchacha20poly1305_TAG_FINAL);
+    e->cbuf.len = 0;
+}
+
+/* ---- archive building (directory walk, streamed) ------------------------ */
+
+/* Sum the sizes of regular files under a path, for the progress total. */
+static uint64_t sum_size(const char *fullpath) {
+    struct stat st;
+    if (lstat(fullpath, &st) != 0) return 0;
+    if (S_ISLNK(st.st_mode)) return (uint64_t)st.st_size;
+    if (S_ISREG(st.st_mode)) return (uint64_t)st.st_size;
+    if (!S_ISDIR(st.st_mode)) return 0;
+    uint64_t total = 0;
+    DIR *d = opendir(fullpath);
+    if (!d) return 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char fp[PATH_MAX];
+        snprintf(fp, sizeof fp, "%s/%s", fullpath, de->d_name);
+        total += sum_size(fp);
+    }
+    closedir(d);
+    return total;
+}
+
+static void add_path(Enc *e, const char *fullpath, const char *relpath);
+
+static void add_dir(Enc *e, const char *fullpath, const char *relpath) {
+    /* Record the directory itself so empty dirs survive. */
+    enc_u8(e, ENT_DIR);
+    enc_u32(e, (uint32_t)strlen(relpath));
+    enc_plain(e, relpath, strlen(relpath));
+
+    DIR *d = opendir(fullpath);
+    if (!d) die_errno("cannot open directory");
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char fp[PATH_MAX], rp[PATH_MAX];
+        snprintf(fp, sizeof fp, "%s/%s", fullpath, de->d_name);
+        snprintf(rp, sizeof rp, "%s/%s", relpath, de->d_name);
+        add_path(e, fp, rp);
+    }
+    closedir(d);
+}
+
+static void add_file(Enc *e, const char *fullpath, const char *relpath) {
+    struct stat st;
+    if (stat(fullpath, &st) != 0) die_errno("cannot stat file");
+    uint64_t size = (uint64_t)st.st_size;
+
+    enc_u8(e, ENT_FILE);
+    enc_u32(e, (uint32_t)strlen(relpath));
+    enc_plain(e, relpath, strlen(relpath));
+    enc_u64(e, size);
+
+    FILE *f = fopen(fullpath, "rb");
+    if (!f) die_errno("cannot read file");
+    unsigned char tmp[1 << 16];
+    uint64_t remaining = size;
+    while (remaining > 0) {
+        size_t want = remaining < sizeof tmp ? (size_t)remaining : sizeof tmp;
+        size_t n = fread(tmp, 1, want, f);
+        if (n == 0) {
+            /* File shrank since stat; pad with zeros to honour the header. */
+            memset(tmp, 0, want);
+            n = want;
+        }
+        enc_plain(e, tmp, n);
+        progress_add(e->prog, n);
+        remaining -= n;
+    }
+    fclose(f);
+}
+
+static void add_link(Enc *e, const char *fullpath, const char *relpath) {
+    char target[PATH_MAX];
+    ssize_t n = readlink(fullpath, target, sizeof target - 1);
+    if (n < 0) die_errno("cannot read symlink");
+    target[n] = 0;
+    enc_u8(e, ENT_LINK);
+    enc_u32(e, (uint32_t)strlen(relpath));
+    enc_plain(e, relpath, strlen(relpath));
+    enc_u64(e, (uint64_t)n);
+    enc_plain(e, target, (size_t)n);
+    progress_add(e->prog, (uint64_t)n);
+}
+
+static void add_path(Enc *e, const char *fullpath, const char *relpath) {
+    struct stat st;
+    if (lstat(fullpath, &st) != 0) die_errno("cannot stat path");
+    if (S_ISLNK(st.st_mode))       add_link(e, fullpath, relpath);
+    else if (S_ISDIR(st.st_mode))  add_dir(e, fullpath, relpath);
+    else if (S_ISREG(st.st_mode))  add_file(e, fullpath, relpath);
+    else fprintf(stderr, "czip: skipping special file %s\n", relpath);
+}
+
+/* ---- archive extraction (streamed) -------------------------------------- */
 
 static void mkdirs(const char *path) {
     char tmp[PATH_MAX];
@@ -229,116 +545,154 @@ static void parent_dirs(const char *path) {
     if (tmp[0]) mkdirs(tmp);
 }
 
-static void extract_archive(const unsigned char *ar, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        uint8_t type = ar[off++];
-        if (len - off < 4) die("corrupt archive");
-        uint32_t nlen = rd_u32(ar + off); off += 4;
-        if (nlen > len - off) die("corrupt archive");
-        char path[PATH_MAX];
-        if (nlen >= sizeof path) die("path too long");
-        memcpy(path, ar + off, nlen); path[nlen] = 0; off += nlen;
+static void check_path(const char *path) {
+    if (path[0] == '/' || strstr(path, "..")) die("unsafe path in archive");
+}
 
-        /* Reject path traversal and empty names. */
-        if (nlen == 0) die("corrupt archive (empty path)");
-        if (path[0] == '/' || strstr(path, "..")) die("unsafe path in archive");
+/* Incremental archive parser: bytes are fed in as they decompress. */
+enum { S_TYPE, S_NLEN, S_NAME, S_SIZE, S_FILE, S_LINK };
 
-        if (type == ENT_DIR) {
-            mkdirs(path);
-        } else if (type == ENT_FILE || type == ENT_LINK) {
-            if (len - off < 8) die("corrupt archive");
-            uint64_t fsz = rd_u64(ar + off); off += 8;
-            if (fsz > len - off) die("corrupt archive");
-            parent_dirs(path);
-            if (type == ENT_FILE) {
-                unlink(path);   /* never write through a pre-existing symlink */
-                write_whole_file(path, ar + off, (size_t)fsz);
-            } else if (fsz == 0) {
-                fprintf(stderr, "czip: skipping symlink with empty target %s\n", path);
+typedef struct {
+    int           state;
+    unsigned char type;
+    unsigned char field[8];     /* staging for nlen (4) or size (8) */
+    size_t        field_need, field_have;
+    char          name[PATH_MAX];
+    uint32_t      nlen, nhave;
+    uint64_t      payload;      /* remaining payload bytes */
+    FILE         *cur;          /* open output file for ENT_FILE */
+    Buf           link;         /* accumulates an ENT_LINK target */
+    Progress     *prog;
+} Ext;
+
+static void ext_init(Ext *x, Progress *prog) {
+    memset(x, 0, sizeof *x);
+    x->state = S_TYPE;
+    buf_init(&x->link);
+    x->prog = prog;
+}
+
+/* Called once a full entry header (name, and size for file/link) is parsed. */
+static void ext_begin_entry(Ext *x) {
+    x->name[x->nlen] = 0;
+    check_path(x->name);
+    if (x->type == ENT_DIR) {
+        mkdirs(x->name);
+        x->state = S_TYPE;
+    } else if (x->type == ENT_FILE) {
+        parent_dirs(x->name);
+        unlink(x->name);                 /* never write through a symlink */
+        x->cur = fopen(x->name, "wb");
+        if (!x->cur) die_errno("cannot open output file");
+        if (x->payload == 0) { fclose(x->cur); x->cur = NULL; x->state = S_TYPE; }
+        else x->state = S_FILE;
+    } else { /* ENT_LINK */
+        x->link.len = 0;
+        if (x->payload == 0) {
+            fprintf(stderr, "czip: skipping symlink with empty target %s\n", x->name);
+            x->state = S_TYPE;
+        } else x->state = S_LINK;
+    }
+}
+
+static void ext_finish_link(Ext *x) {
+    if (x->link.len >= PATH_MAX) die("symlink target too long");
+    char target[PATH_MAX];
+    memcpy(target, x->link.data, x->link.len);
+    target[x->link.len] = 0;
+    parent_dirs(x->name);
+    /* Never create a link that escapes the tree. */
+    if (target[0] == '/' || strstr(target, "..")) {
+        fprintf(stderr, "czip: skipping unsafe symlink %s -> %s\n", x->name, target);
+    } else {
+        unlink(x->name);
+        if (symlink(target, x->name) != 0) die_errno("cannot create symlink");
+    }
+}
+
+static void ext_feed(Ext *x, const unsigned char *p, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        switch (x->state) {
+        case S_TYPE:
+            x->type = p[i++];
+            if (x->type != ENT_FILE && x->type != ENT_DIR && x->type != ENT_LINK)
+                die("corrupt archive (bad entry type)");
+            x->field_need = 4; x->field_have = 0;
+            x->state = S_NLEN;
+            break;
+        case S_NLEN: {
+            size_t take = x->field_need - x->field_have;
+            if (take > n - i) take = n - i;
+            memcpy(x->field + x->field_have, p + i, take);
+            x->field_have += take; i += take;
+            if (x->field_have < x->field_need) break;
+            x->nlen = rd_u32(x->field);
+            if (x->nlen == 0) die("corrupt archive (empty path)");
+            if (x->nlen >= PATH_MAX) die("path too long");
+            x->nhave = 0;
+            x->state = S_NAME;
+            break;
+        }
+        case S_NAME: {
+            size_t take = x->nlen - x->nhave;
+            if (take > n - i) take = n - i;
+            memcpy(x->name + x->nhave, p + i, take);
+            x->nhave += take; i += take;
+            if (x->nhave < x->nlen) break;
+            if (x->type == ENT_DIR) {
+                x->name[x->nlen] = 0;
+                ext_begin_entry(x);
             } else {
-                if (fsz >= PATH_MAX) die("symlink target too long");
-                char target[PATH_MAX];
-                memcpy(target, ar + off, (size_t)fsz);
-                target[fsz] = 0;
-                /* Skip absolute or traversing targets: never create a link
-                 * that escapes the tree, so later writes can't follow one
-                 * out. Skip-and-warn rather than abort the whole extraction. */
-                if (target[0] == '/' || strstr(target, "..")) {
-                    fprintf(stderr,
-                        "czip: skipping unsafe symlink %s -> %s\n", path, target);
-                } else {
-                    unlink(path);   /* replace any existing entry */
-                    if (symlink(target, path) != 0)
-                        die_errno("cannot create symlink");
-                }
+                x->field_need = 8; x->field_have = 0;
+                x->state = S_SIZE;
             }
-            off += fsz;
-        } else {
-            die("corrupt archive (bad entry type)");
+            break;
+        }
+        case S_SIZE: {
+            size_t take = x->field_need - x->field_have;
+            if (take > n - i) take = n - i;
+            memcpy(x->field + x->field_have, p + i, take);
+            x->field_have += take; i += take;
+            if (x->field_have < x->field_need) break;
+            x->payload = rd_u64(x->field);
+            ext_begin_entry(x);
+            break;
+        }
+        case S_FILE: {
+            size_t take = x->payload < n - i ? (size_t)x->payload : n - i;
+            if (take && fwrite(p + i, 1, take, x->cur) != take)
+                die_errno("write failed");
+            i += take; x->payload -= take;
+            progress_add(x->prog, take);
+            if (x->payload == 0) {
+                fclose(x->cur); x->cur = NULL;
+                x->state = S_TYPE;
+            }
+            break;
+        }
+        case S_LINK: {
+            size_t take = x->payload < n - i ? (size_t)x->payload : n - i;
+            buf_append(&x->link, p + i, take);
+            i += take; x->payload -= take;
+            progress_add(x->prog, take);
+            if (x->payload == 0) {
+                ext_finish_link(x);
+                x->state = S_TYPE;
+            }
+            break;
+        }
         }
     }
 }
 
-/* ---- compression (multithreaded zstd) ----------------------------------- */
-
-static long cpu_count(void) {
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
-    return n > 0 ? n : 1;
+static void ext_done(Ext *x) {
+    if (x->state != S_TYPE) die("corrupt archive (truncated entry)");
+    if (x->cur) fclose(x->cur);
+    buf_free(&x->link);
 }
 
-static void zstd_compress(const Buf *in, Buf *out, int level, int workers) {
-    ZSTD_CCtx *c = ZSTD_createCCtx();
-    if (!c) die("zstd init failed");
-    ZSTD_CCtx_setParameter(c, ZSTD_c_compressionLevel, level);
-    /* nbWorkers > 0 enables multithreaded compression; ignored gracefully
-     * if this libzstd was built without thread support. */
-    ZSTD_CCtx_setParameter(c, ZSTD_c_nbWorkers, workers);
-
-    size_t bound = ZSTD_compressBound(in->len);
-    buf_reserve(out, bound);
-    size_t r = ZSTD_compress2(c, out->data + out->len, bound, in->data, in->len);
-    if (ZSTD_isError(r)) die(ZSTD_getErrorName(r));
-    out->len += r;
-    ZSTD_freeCCtx(c);
-}
-
-static void zstd_decompress(const unsigned char *in, size_t inlen, Buf *out) {
-    unsigned long long sz = ZSTD_getFrameContentSize(in, inlen);
-    if (sz == ZSTD_CONTENTSIZE_ERROR || sz == ZSTD_CONTENTSIZE_UNKNOWN)
-        die("not a valid zstd stream");
-    buf_reserve(out, (size_t)sz);
-    size_t r = ZSTD_decompress(out->data, (size_t)sz, in, inlen);
-    if (ZSTD_isError(r)) die(ZSTD_getErrorName(r));
-    out->len += r;
-}
-
-/* ---- key derivation ----------------------------------------------------- */
-
-static void derive_key(unsigned char *key, const char *password,
-                       const unsigned char *salt,
-                       unsigned long long ops, size_t mem) {
-    if (crypto_pwhash(key, crypto_aead_xchacha20poly1305_ietf_KEYBYTES,
-                      password, strlen(password), salt, ops, mem,
-                      crypto_pwhash_ALG_ARGON2ID13) != 0)
-        die("key derivation failed (out of memory?)");
-}
-
-/* ---- output naming and splitting ---------------------------------------- */
-
-/* Format a byte count into a human-friendly string, e.g. "3.0 MB". */
-static void human_size(double bytes, char *out, size_t outsz) {
-    const char *u[] = { "B", "KB", "MB", "GB", "TB" };
-    int i = 0;
-    while (bytes >= 1024.0 && i < 4) { bytes /= 1024.0; i++; }
-    if (i == 0) snprintf(out, outsz, "%.0f %s", bytes, u[i]);
-    else        snprintf(out, outsz, "%.2f %s", bytes, u[i]);
-}
-
-static int file_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0;
-}
+/* ---- output naming ------------------------------------------------------ */
 
 /* Pick "<base>.cz", or "<base>.czip" if the .cz already exists. */
 static void choose_output_name(const char *base, char *out, size_t outsz) {
@@ -346,122 +700,15 @@ static void choose_output_name(const char *base, char *out, size_t outsz) {
     if (file_exists(out)) snprintf(out, outsz, "%s.czip", base);
 }
 
-/* Write the blob as one file, or as <name>.001/.002/... if split > 0 bytes. */
-static void write_output(const char *name, const unsigned char *data,
-                         size_t len, size_t split) {
-    if (split == 0 || len <= split) {
-        write_whole_file(name, data, len);
-        info("czip: wrote %s (%zu bytes)\n", name, len);
-        return;
-    }
-    size_t parts = (len + split - 1) / split;
-    for (size_t i = 0; i < parts; i++) {
-        char part[PATH_MAX + 32];
-        snprintf(part, sizeof part, "%s.%03zu", name, i + 1);
-        size_t chunk = (i + 1 == parts) ? len - i * split : split;
-        write_whole_file(part, data + i * split, chunk);
-        info("czip: wrote %s (%zu bytes)\n", part, chunk);
-    }
-    info("czip: split into %zu parts\n", parts);
-}
-
-/* Load a container: either <name> directly, or reassemble <name>.001.. parts.
- * Accepts being given the base name or a ".001" part name. */
-static void read_container(const char *name, Buf *out) {
-    if (file_exists(name)) {
-        /* Did the user hand us the first part directly? */
-        size_t n = strlen(name);
-        if (n > 4 && name[n - 4] == '.' &&
-            name[n-3] >= '0' && name[n-3] <= '9' &&
-            name[n-2] >= '0' && name[n-2] <= '9' &&
-            name[n-1] >= '0' && name[n-1] <= '9') {
-            char base[PATH_MAX];
-            snprintf(base, sizeof base, "%.*s", (int)(n - 4), name);
-            if (file_exists(name)) { read_container(base, out); return; }
-        }
-        if (read_whole_file(name, out) != 0) die_errno("cannot read input");
-        return;
-    }
-    /* Try split parts <name>.001, .002, ... */
-    char part[PATH_MAX + 32];
-    snprintf(part, sizeof part, "%s.001", name);
-    if (!file_exists(part)) die("input file not found");
-    for (size_t i = 1; ; i++) {
-        snprintf(part, sizeof part, "%s.%03zu", name, i);
-        if (!file_exists(part)) break;
-        if (read_whole_file(part, out) != 0) die_errno("cannot read part");
-    }
-}
-
 /* ---- compress command --------------------------------------------------- */
 
 static void cmd_compress(const char *input, const char *password,
-                         int algo, int level, int workers, size_t split,
+                         int level, int workers, size_t split,
                          const char *out_override) {
     struct stat st;
     if (lstat(input, &st) != 0) die_errno("input path not found");
 
-    /* 1. Build plaintext archive. */
-    Buf archive; buf_init(&archive);
-    add_path(&archive, input, base_name(input));
-    size_t original_size = archive.len;
-
-    /* 2. Compress. */
-    Buf comp; buf_init(&comp);
-    zstd_compress(&archive, &comp, level, workers);
-    buf_free(&archive);
-
-    /* 3. Derive key from password. */
-    unsigned char salt[crypto_pwhash_SALTBYTES];
-    randombytes_buf(salt, sizeof salt);
-    unsigned long long ops = crypto_pwhash_OPSLIMIT_MODERATE;
-    size_t mem = crypto_pwhash_MEMLIMIT_MODERATE;
-    unsigned char key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
-    derive_key(key, password, salt, ops, mem);
-
-    /* 4. Encrypt. */
-    size_t npub = (algo == ALG_XCHACHA)
-        ? crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
-        : crypto_aead_chacha20poly1305_ietf_NPUBBYTES;
-    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
-    randombytes_buf(nonce, npub);
-
-    /* Build the on-disk container: header (authenticated as AD) + ciphertext. */
-    Buf hdr; buf_init(&hdr);
-    buf_append(&hdr, CZIP_MAGIC, 4);
-    buf_u8(&hdr, CZIP_FORMAT);
-    buf_u8(&hdr, CZIP_VER_MAJOR);
-    buf_u8(&hdr, CZIP_VER_MINOR);
-    buf_u8(&hdr, CZIP_VER_PATCH);
-    buf_u8(&hdr, (uint8_t)algo);
-    buf_u64(&hdr, ops);
-    buf_u64(&hdr, mem);
-    buf_append(&hdr, salt, sizeof salt);
-    buf_u8(&hdr, (uint8_t)npub);
-    buf_append(&hdr, nonce, npub);
-
-    unsigned char *ct = xmalloc(comp.len + crypto_aead_xchacha20poly1305_ietf_ABYTES);
-    unsigned long long ct_len = 0;
-    if (algo == ALG_XCHACHA) {
-        crypto_aead_xchacha20poly1305_ietf_encrypt(
-            ct, &ct_len, comp.data, comp.len,
-            hdr.data, hdr.len, NULL, nonce, key);
-    } else {
-        crypto_aead_chacha20poly1305_ietf_encrypt(
-            ct, &ct_len, comp.data, comp.len,
-            hdr.data, hdr.len, NULL, nonce, key);
-    }
-    sodium_memzero(key, sizeof key);
-    buf_free(&comp);
-
-    Buf container; buf_init(&container);
-    buf_append(&container, hdr.data, hdr.len);
-    buf_u64(&container, ct_len);
-    buf_append(&container, ct, ct_len);
-    buf_free(&hdr);
-    free(ct);
-
-    /* 5. Name + write (with optional splitting). */
+    /* Output name. */
     char outname[PATH_MAX];
     if (out_override) {
         snprintf(outname, sizeof outname, "%s", out_override);
@@ -474,109 +721,197 @@ static void cmd_compress(const char *input, const char *password,
         choose_output_name(clean, outname, sizeof outname);
     }
 
-    size_t output_size = container.len;
-    write_output(outname, container.data, container.len, split);
-    buf_free(&container);
+    /* Derive key from password. */
+    unsigned char salt[crypto_pwhash_SALTBYTES];
+    randombytes_buf(salt, sizeof salt);
+    unsigned long long ops = crypto_pwhash_OPSLIMIT_MODERATE;
+    size_t mem = crypto_pwhash_MEMLIMIT_MODERATE;
+    unsigned char key[crypto_secretstream_xchacha20poly1305_KEYBYTES];
+    derive_key(key, password, salt, ops, mem);
+
+    /* Build the on-disk header (also bound into the first encrypted chunk). */
+    Buf hdr; buf_init(&hdr);
+    buf_append(&hdr, CZIP_MAGIC, 4);
+    buf_u8(&hdr, CZIP_FORMAT);
+    buf_u8(&hdr, CZIP_VER_MAJOR);
+    buf_u8(&hdr, CZIP_VER_MINOR);
+    buf_u8(&hdr, CZIP_VER_PATCH);
+    buf_u8(&hdr, (uint8_t)ALG_XCHACHA);
+    buf_u64(&hdr, ops);
+    buf_u64(&hdr, mem);
+    buf_append(&hdr, salt, sizeof salt);
+
+    OutStream out;
+    out_open(&out, outname, split);
+
+    Enc e;
+    memset(&e, 0, sizeof e);
+    e.out = &out;
+    buf_init(&e.cbuf);
+    e.cctx = ZSTD_createCCtx();
+    if (!e.cctx) die("zstd init failed");
+    ZSTD_CCtx_setParameter(e.cctx, ZSTD_c_compressionLevel, level);
+    /* nbWorkers > 0 enables multithreaded compression; ignored gracefully
+     * if this libzstd was built without thread support. */
+    ZSTD_CCtx_setParameter(e.cctx, ZSTD_c_nbWorkers, workers);
+    e.zcap = ZSTD_CStreamOutSize();
+    e.zbuf = xmalloc(e.zcap);
+
+    /* Secretstream header goes right after our header, then the chunk stream. */
+    unsigned char ss_header[crypto_secretstream_xchacha20poly1305_HEADERBYTES];
+    crypto_secretstream_xchacha20poly1305_init_push(&e.st, ss_header, key);
+    sodium_memzero(key, sizeof key);
+    buf_append(&hdr, ss_header, sizeof ss_header);
+
+    out_write(&out, hdr.data, hdr.len);
+    /* The whole header authenticates the stream via the first chunk's AD. */
+    e.ad = hdr.data;
+    e.adlen = hdr.len;
+
+    Progress prog;
+    progress_init(&prog, "compressing", sum_size(input));
+    e.prog = &prog;
+
+    /* Stream: walk -> zstd -> secretstream -> output. */
+    add_path(&e, input, base_name(input));
+    enc_finish(&e);
+    progress_draw(&prog, 1);
+
+    out_close(&out);
+    uint64_t original_size = e.plain_total;
+    uint64_t output_size = out.total;
+
+    ZSTD_freeCCtx(e.cctx);
+    free(e.zbuf);
+    buf_free(&e.cbuf);
+    buf_free(&hdr);
 
     char hin[32], hout[32];
     human_size((double)original_size, hin, sizeof hin);
     human_size((double)output_size, hout, sizeof hout);
-    info("czip: %s -> %s [%s]\n", input, outname,
-           algo == ALG_XCHACHA ? "XChaCha20-Poly1305" : "ChaCha20-Poly1305");
+    info("czip: %s -> %s [XChaCha20-Poly1305]\n", input, outname);
     if (output_size <= original_size && original_size > 0) {
-        double saved = (1.0 - (double)output_size / original_size) * 100.0;
-        info("czip: before %s (%zu bytes)  after %s (%zu bytes)  saved %.1f%%\n",
-             hin, original_size, hout, output_size, saved);
+        double saved = (1.0 - (double)output_size / (double)original_size) * 100.0;
+        info("czip: before %s (%llu bytes)  after %s (%llu bytes)  saved %.1f%%\n",
+             hin, (unsigned long long)original_size,
+             hout, (unsigned long long)output_size, saved);
     } else {
-        /* Incompressible or tiny input: crypto/header overhead dominates. */
         double grew = original_size
-            ? ((double)output_size / original_size - 1.0) * 100.0 : 0.0;
-        info("czip: before %s (%zu bytes)  after %s (%zu bytes)  grew %.1f%% (overhead)\n",
-             hin, original_size, hout, output_size, grew);
+            ? ((double)output_size / (double)original_size - 1.0) * 100.0 : 0.0;
+        info("czip: before %s (%llu bytes)  after %s (%llu bytes)  grew %.1f%% (overhead)\n",
+             hin, (unsigned long long)original_size,
+             hout, (unsigned long long)output_size, grew);
     }
 }
 
 /* ---- decompress command ------------------------------------------------- */
 
 static void cmd_decompress(const char *input, const char *password) {
-    Buf c; buf_init(&c);
-    read_container(input, &c);
+    InStream in;
+    in_open(&in, input);
 
-    const unsigned char *p = c.data;
-    size_t len = c.len, off = 0;
+    /* Fixed header prefix: magic, format, version, algo, argon params, salt. */
+    const size_t PREFIX = 4 + 1 + 3 + 1 + 8 + 8 + crypto_pwhash_SALTBYTES;
+    unsigned char hdr[4 + 1 + 3 + 1 + 8 + 8 + crypto_pwhash_SALTBYTES
+                      + crypto_secretstream_xchacha20poly1305_HEADERBYTES];
+    in_readfull(&in, hdr, PREFIX);
 
-    /* Fixed-size header prefix up to and including the npub-length byte. */
-    const size_t FIXED = 4 + 1 + 3 + 1 + 8 + 8 + crypto_pwhash_SALTBYTES + 1;
-    if (len < FIXED) die("not a czip file (too short)");
-    if (memcmp(p, CZIP_MAGIC, 4) != 0) die("not a czip file");
+    size_t off = 0;
+    if (memcmp(hdr, CZIP_MAGIC, 4) != 0) die("not a czip file");
     off = 4;
-    uint8_t fmt   = p[off++];
+    uint8_t fmt = hdr[off++];
     if (fmt != CZIP_FORMAT) die("unsupported container format");
     off += 3;                              /* writer version (informational) */
-    uint8_t algo  = p[off++];
-    if (algo != ALG_CHACHA && algo != ALG_XCHACHA) die("unknown cipher in header");
-    uint64_t ops  = rd_u64(p + off); off += 8;
-    uint64_t mem  = rd_u64(p + off); off += 8;
-    const unsigned char *salt = p + off; off += crypto_pwhash_SALTBYTES;
-    uint8_t npub  = p[off++];
+    uint8_t algo = hdr[off++];
+    if (algo != ALG_XCHACHA) die("unknown cipher in header");
+    uint64_t ops = rd_u64(hdr + off); off += 8;
+    uint64_t mem = rd_u64(hdr + off); off += 8;
+    const unsigned char *salt = hdr + off; off += crypto_pwhash_SALTBYTES;
 
-    /* npub must match the cipher; reject anything else before using it. */
-    size_t expect_npub = (algo == ALG_XCHACHA)
-        ? crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
-        : crypto_aead_chacha20poly1305_ietf_NPUBBYTES;
-    if (npub != expect_npub) die("corrupt header (nonce size mismatch)");
-    if (len - off < (size_t)npub + 8) die("corrupt or truncated container");
-    const unsigned char *nonce = p + off; off += npub;
+    /* Secretstream header follows; it is part of the authenticated AD. */
+    in_readfull(&in, hdr + PREFIX,
+                crypto_secretstream_xchacha20poly1305_HEADERBYTES);
+    const unsigned char *ss_header = hdr + PREFIX;
+    size_t hdr_len = PREFIX + crypto_secretstream_xchacha20poly1305_HEADERBYTES;
 
-    size_t hdr_len = off;                  /* header was the AD */
-    uint64_t ct_len = rd_u64(p + off); off += 8;
-    const unsigned char *ct = p + off;
-    if (ct_len > len - off) die("corrupt or truncated container");
-    if (ct_len < crypto_aead_chacha20poly1305_ietf_ABYTES)
-        die("corrupt container (ciphertext too short)");
-
-    unsigned char key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
+    unsigned char key[crypto_secretstream_xchacha20poly1305_KEYBYTES];
     derive_key(key, password, salt, ops, mem);
 
-    Buf comp; buf_init(&comp);
-    buf_reserve(&comp, ct_len);
-    unsigned long long out_len = 0;
-    int ok;
-    if (algo == ALG_XCHACHA) {
-        ok = crypto_aead_xchacha20poly1305_ietf_decrypt(
-            comp.data, &out_len, NULL, ct, ct_len,
-            p, hdr_len, nonce, key);
-    } else {
-        ok = crypto_aead_chacha20poly1305_ietf_decrypt(
-            comp.data, &out_len, NULL, ct, ct_len,
-            p, hdr_len, nonce, key);
+    crypto_secretstream_xchacha20poly1305_state st;
+    if (crypto_secretstream_xchacha20poly1305_init_pull(&st, ss_header, key) != 0) {
+        sodium_memzero(key, sizeof key);
+        die("corrupt container (bad stream header)");
     }
     sodium_memzero(key, sizeof key);
-    if (ok != 0) die("decryption failed: wrong password or corrupted/tampered file");
-    comp.len = out_len;
 
-    Buf archive; buf_init(&archive);
-    zstd_decompress(comp.data, comp.len, &archive);
-    buf_free(&comp);
+    ZSTD_DCtx *dctx = ZSTD_createDCtx();
+    if (!dctx) die("zstd init failed");
+    size_t dcap = ZSTD_DStreamOutSize();
+    unsigned char *dbuf = xmalloc(dcap);
 
-    extract_archive(archive.data, archive.len);
+    Progress prog;
+    progress_init(&prog, "extracting", 0);
+    Ext ext;
+    ext_init(&ext, &prog);
+
+    const unsigned char *ad = hdr;     /* bind header to the first chunk */
+    size_t adlen = hdr_len;
+    const size_t MAXCT = CZIP_CHUNK + crypto_secretstream_xchacha20poly1305_ABYTES;
+    unsigned char *ct = xmalloc(MAXCT);
+    unsigned char *plain = xmalloc(CZIP_CHUNK);
+
+    int saw_final = 0;
+    for (;;) {
+        unsigned char lp[4];
+        if (in_read(&in, lp, 4) != 4) die("corrupt or truncated container");
+        uint32_t clen = rd_u32(lp);
+        if (clen < crypto_secretstream_xchacha20poly1305_ABYTES || clen > MAXCT)
+            die("corrupt container (bad chunk size)");
+        in_readfull(&in, ct, clen);
+
+        unsigned long long plen = 0;
+        unsigned char tag = 0;
+        if (crypto_secretstream_xchacha20poly1305_pull(
+                &st, plain, &plen, &tag, ct, clen, ad, adlen) != 0)
+            die("decryption failed: wrong password or corrupted/tampered file");
+        ad = NULL; adlen = 0;
+
+        /* Decompress this chunk and feed the archive parser. */
+        ZSTD_inBuffer zin = { plain, (size_t)plen, 0 };
+        while (zin.pos < zin.size) {
+            ZSTD_outBuffer zout = { dbuf, dcap, 0 };
+            size_t r = ZSTD_decompressStream(dctx, &zout, &zin);
+            if (ZSTD_isError(r)) die(ZSTD_getErrorName(r));
+            if (zout.pos) ext_feed(&ext, dbuf, zout.pos);
+        }
+
+        if (tag == crypto_secretstream_xchacha20poly1305_TAG_FINAL) {
+            saw_final = 1;
+            break;
+        }
+    }
+    if (!saw_final) die("corrupt container (missing final chunk)");
+
+    progress_draw(&prog, 1);
+    ext_done(&ext);
+
+    ZSTD_freeDCtx(dctx);
+    free(dbuf); free(ct); free(plain);
+    in_close(&in);
     info("czip: extracted %s\n", input);
-    buf_free(&archive);
-    buf_free(&c);
 }
 
 /* ---- CLI ---------------------------------------------------------------- */
 
 static void usage(void) {
     printf(
-"czip " CZIP_VERSION_STR " - compress + ChaCha20-Poly1305 authenticated encryption\n\n"
+"czip " CZIP_VERSION_STR " - compress + XChaCha20-Poly1305 authenticated encryption\n\n"
 "USAGE:\n"
 "  czip [options] <file-or-directory>      compress & encrypt\n"
 "  czip -d [options] <archive.cz>          decrypt & extract\n\n"
 "OPTIONS:\n"
 "  -p, --password <pw>   password (required; or set CZIP_PASSWORD env var)\n"
 "  -d, --decompress      extract mode\n"
-"      --xchacha         use XChaCha20-Poly1305 (24-byte nonce, safer)\n"
 "  -l, --level <1-22>    zstd compression level (default 19)\n"
 "  -T, --threads <n>     worker threads (default: all CPU cores)\n"
 "      --split <MB>      split output into parts of <MB> megabytes each\n"
@@ -585,6 +920,8 @@ static void usage(void) {
 "  -h, --help            show this help\n"
 "  -v, --version         show version\n\n"
 "NOTES:\n"
+"  Compression, encryption and writing are fully streamed, so memory use stays\n"
+"  flat regardless of input size; progress is shown on stderr.\n"
 "  Output extension is .cz, or .czip if a .cz file already exists.\n"
 "  Split parts are named <out>.001, <out>.002, ...; extraction auto-reassembles.\n");
 }
@@ -594,7 +931,7 @@ int main(int argc, char **argv) {
 
     const char *password = getenv("CZIP_PASSWORD");
     const char *input = NULL, *output = NULL;
-    int decompress = 0, algo = ALG_CHACHA, level = 19;
+    int decompress = 0, level = 19;
     int workers = (int)cpu_count();
     size_t split = 0;
 
@@ -606,7 +943,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(a, "-d") || !strcmp(a, "--decompress")) decompress = 1;
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) g_quiet = 1;
-        else if (!strcmp(a, "--xchacha")) algo = ALG_XCHACHA;
+        else if (!strcmp(a, "--xchacha")) { /* accepted for compatibility; always on */ }
         else if (!strcmp(a, "-p") || !strcmp(a, "--password")) {
             if (++i >= argc) die("missing value for --password");
             password = argv[i];
@@ -640,6 +977,6 @@ int main(int argc, char **argv) {
         die("a password is required (use -p <pw> or the CZIP_PASSWORD env var)");
 
     if (decompress) cmd_decompress(input, password);
-    else cmd_compress(input, password, algo, level, workers, split, output);
+    else cmd_compress(input, password, level, workers, split, output);
     return 0;
 }
