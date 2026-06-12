@@ -939,7 +939,8 @@ int main(int argc, char **argv) {
         const char *a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (!strcmp(a, "-v") || !strcmp(a, "--version")) {
-            printf("czip " CZIP_VERSION_STR "\n"); return 0;
+            printf("czip " CZIP_VERSION_STR "\n"
+                   "Author: Jean-Francois Lachance-Caumartin\n"); return 0;
         }
         else if (!strcmp(a, "-d") || !strcmp(a, "--decompress")) decompress = 1;
         else if (!strcmp(a, "-q") || !strcmp(a, "--quiet")) g_quiet = 1;
