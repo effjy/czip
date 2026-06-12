@@ -101,6 +101,7 @@ Verify:
 ```sh
 czip --version
 # czip 1.1.0
+# Author: Jean-Francois Lachance-Caumartin
 ```
 
 ## Uninstall
