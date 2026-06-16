@@ -1,6 +1,6 @@
 <div align="center">
   
-<a href="https://github.com/effjy/czip/"><img src="titles/czip-title.svg" height="44" alt="Czip"></a>
+<a href="https://github.com/effjy/czip/"><img src="titles/czip-title.svg" height="52" alt="Czip"></a>
 
 [![Language](https://img.shields.io/badge/language-C-blue.svg)](https://github.com/effjy/czip)
 [![Crypto](https://img.shields.io/badge/crypto-XChaCha20--Poly1305-green.svg)](https://doc.libsodium.org/secret-key_cryptography/secretstream)
