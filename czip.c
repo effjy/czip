@@ -30,18 +30,20 @@
 #include <errno.h>
 #include <limits.h>
 #include <time.h>
+#include <fcntl.h>
 
 #include <sodium.h>
 #include <zstd.h>
 
 #define CZIP_VER_MAJOR 1
-#define CZIP_VER_MINOR 1
+#define CZIP_VER_MINOR 2
 #define CZIP_VER_PATCH 0
-#define CZIP_VERSION_STR "1.1.0"
+#define CZIP_VERSION_STR "1.2.0"
 
 /* On-disk container header. */
 static const unsigned char CZIP_MAGIC[4] = { 'C', 'Z', 'I', 'P' };
-#define CZIP_FORMAT 2                 /* container format version (2 = streamed) */
+#define CZIP_FORMAT     3   /* current container format (3 = per-entry mode+mtime) */
+#define CZIP_FORMAT_MIN 2   /* oldest container format we can still read         */
 
 #define ALG_XCHACHA  1                /* secretstream is XChaCha20-Poly1305 based */
 
@@ -451,11 +453,19 @@ static uint64_t sum_size(const char *fullpath) {
 
 static void add_path(Enc *e, const char *fullpath, const char *relpath);
 
-static void add_dir(Enc *e, const char *fullpath, const char *relpath) {
-    /* Record the directory itself so empty dirs survive. */
-    enc_u8(e, ENT_DIR);
+/* Emit the per-entry name and metadata (mode + mtime) shared by all types. */
+static void enc_name_meta(Enc *e, const char *relpath, const struct stat *st) {
     enc_u32(e, (uint32_t)strlen(relpath));
     enc_plain(e, relpath, strlen(relpath));
+    enc_u32(e, (uint32_t)(st->st_mode & 07777));
+    enc_u64(e, (uint64_t)(int64_t)st->st_mtime);
+}
+
+static void add_dir(Enc *e, const char *fullpath, const char *relpath,
+                    const struct stat *st) {
+    /* Record the directory itself so empty dirs survive. */
+    enc_u8(e, ENT_DIR);
+    enc_name_meta(e, relpath, st);
 
     DIR *d = opendir(fullpath);
     if (!d) die_errno("cannot open directory");
@@ -470,14 +480,12 @@ static void add_dir(Enc *e, const char *fullpath, const char *relpath) {
     closedir(d);
 }
 
-static void add_file(Enc *e, const char *fullpath, const char *relpath) {
-    struct stat st;
-    if (stat(fullpath, &st) != 0) die_errno("cannot stat file");
-    uint64_t size = (uint64_t)st.st_size;
+static void add_file(Enc *e, const char *fullpath, const char *relpath,
+                     const struct stat *st) {
+    uint64_t size = (uint64_t)st->st_size;
 
     enc_u8(e, ENT_FILE);
-    enc_u32(e, (uint32_t)strlen(relpath));
-    enc_plain(e, relpath, strlen(relpath));
+    enc_name_meta(e, relpath, st);
     enc_u64(e, size);
 
     FILE *f = fopen(fullpath, "rb");
@@ -499,14 +507,14 @@ static void add_file(Enc *e, const char *fullpath, const char *relpath) {
     fclose(f);
 }
 
-static void add_link(Enc *e, const char *fullpath, const char *relpath) {
+static void add_link(Enc *e, const char *fullpath, const char *relpath,
+                     const struct stat *st) {
     char target[PATH_MAX];
     ssize_t n = readlink(fullpath, target, sizeof target - 1);
     if (n < 0) die_errno("cannot read symlink");
     target[n] = 0;
     enc_u8(e, ENT_LINK);
-    enc_u32(e, (uint32_t)strlen(relpath));
-    enc_plain(e, relpath, strlen(relpath));
+    enc_name_meta(e, relpath, st);
     enc_u64(e, (uint64_t)n);
     enc_plain(e, target, (size_t)n);
     progress_add(e->prog, (uint64_t)n);
@@ -515,9 +523,9 @@ static void add_link(Enc *e, const char *fullpath, const char *relpath) {
 static void add_path(Enc *e, const char *fullpath, const char *relpath) {
     struct stat st;
     if (lstat(fullpath, &st) != 0) die_errno("cannot stat path");
-    if (S_ISLNK(st.st_mode))       add_link(e, fullpath, relpath);
-    else if (S_ISDIR(st.st_mode))  add_dir(e, fullpath, relpath);
-    else if (S_ISREG(st.st_mode))  add_file(e, fullpath, relpath);
+    if (S_ISLNK(st.st_mode))       add_link(e, fullpath, relpath, &st);
+    else if (S_ISDIR(st.st_mode))  add_dir(e, fullpath, relpath, &st);
+    else if (S_ISREG(st.st_mode))  add_file(e, fullpath, relpath, &st);
     else fprintf(stderr, "czip: skipping special file %s\n", relpath);
 }
 
@@ -545,31 +553,81 @@ static void parent_dirs(const char *path) {
     if (tmp[0]) mkdirs(tmp);
 }
 
+/* True if the path is absolute or contains a ".." component (traversal).
+ * Unlike a plain substring test, this allows legitimate names like "a..b". */
+static int path_is_unsafe(const char *path) {
+    if (path[0] == '/') return 1;
+    for (const char *p = path; *p; p++) {
+        if ((p == path || p[-1] == '/') &&
+            p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0'))
+            return 1;
+    }
+    return 0;
+}
+
 static void check_path(const char *path) {
-    if (path[0] == '/' || strstr(path, "..")) die("unsafe path in archive");
+    if (path_is_unsafe(path)) die("unsafe path in archive");
+}
+
+/* Best-effort restore of a path's modification time (atime set to match). */
+static void set_times(const char *path, int64_t mtime, int nofollow) {
+    struct timespec ts[2];
+    ts[0].tv_sec = (time_t)mtime; ts[0].tv_nsec = 0;
+    ts[1].tv_sec = (time_t)mtime; ts[1].tv_nsec = 0;
+    utimensat(AT_FDCWD, path, ts, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
 }
 
 /* Incremental archive parser: bytes are fed in as they decompress. */
-enum { S_TYPE, S_NLEN, S_NAME, S_SIZE, S_FILE, S_LINK };
+enum { S_TYPE, S_NLEN, S_NAME, S_META, S_SIZE, S_FILE, S_LINK };
+
+/* Deferred directory metadata: applied at the end, deepest-first, so that
+ * writing children never clobbers a directory's restored mode/mtime. */
+typedef struct { char *path; uint32_t mode; int64_t mtime; } DirFix;
 
 typedef struct {
     int           state;
+    int           has_meta;     /* format >= 3 carries per-entry mode + mtime */
     unsigned char type;
-    unsigned char field[8];     /* staging for nlen (4) or size (8) */
+    unsigned char field[12];    /* staging for nlen (4), meta (12) or size (8) */
     size_t        field_need, field_have;
     char          name[PATH_MAX];
     uint32_t      nlen, nhave;
+    uint32_t      mode;         /* current entry mode (0 if absent) */
+    int64_t       mtime;        /* current entry mtime (0 if absent) */
     uint64_t      payload;      /* remaining payload bytes */
     FILE         *cur;          /* open output file for ENT_FILE */
     Buf           link;         /* accumulates an ENT_LINK target */
+    DirFix       *dirs;         /* pending directory fixups */
+    size_t        ndirs, dirs_cap;
     Progress     *prog;
 } Ext;
 
-static void ext_init(Ext *x, Progress *prog) {
+static void ext_init(Ext *x, Progress *prog, int has_meta) {
     memset(x, 0, sizeof *x);
     x->state = S_TYPE;
+    x->has_meta = has_meta;
     buf_init(&x->link);
     x->prog = prog;
+}
+
+static void ext_defer_dir(Ext *x) {
+    if (x->ndirs == x->dirs_cap) {
+        x->dirs_cap = x->dirs_cap ? x->dirs_cap * 2 : 16;
+        x->dirs = realloc(x->dirs, x->dirs_cap * sizeof *x->dirs);
+        if (!x->dirs) die("out of memory");
+    }
+    DirFix *df = &x->dirs[x->ndirs++];
+    df->path = xmalloc(strlen(x->name) + 1);
+    strcpy(df->path, x->name);
+    df->mode = x->mode;
+    df->mtime = x->mtime;
+}
+
+/* Apply a regular file's restored mode and mtime (best effort). */
+static void apply_file_meta(Ext *x, const char *path) {
+    if (!x->has_meta) return;
+    if (x->mode) chmod(path, x->mode & 07777);
+    set_times(path, x->mtime, 0);
 }
 
 /* Called once a full entry header (name, and size for file/link) is parsed. */
@@ -578,13 +636,18 @@ static void ext_begin_entry(Ext *x) {
     check_path(x->name);
     if (x->type == ENT_DIR) {
         mkdirs(x->name);
+        if (x->has_meta) ext_defer_dir(x);   /* mode/mtime restored at the end */
         x->state = S_TYPE;
     } else if (x->type == ENT_FILE) {
         parent_dirs(x->name);
         unlink(x->name);                 /* never write through a symlink */
         x->cur = fopen(x->name, "wb");
         if (!x->cur) die_errno("cannot open output file");
-        if (x->payload == 0) { fclose(x->cur); x->cur = NULL; x->state = S_TYPE; }
+        if (x->payload == 0) {
+            fclose(x->cur); x->cur = NULL;
+            apply_file_meta(x, x->name);
+            x->state = S_TYPE;
+        }
         else x->state = S_FILE;
     } else { /* ENT_LINK */
         x->link.len = 0;
@@ -602,11 +665,12 @@ static void ext_finish_link(Ext *x) {
     target[x->link.len] = 0;
     parent_dirs(x->name);
     /* Never create a link that escapes the tree. */
-    if (target[0] == '/' || strstr(target, "..")) {
+    if (path_is_unsafe(target)) {
         fprintf(stderr, "czip: skipping unsafe symlink %s -> %s\n", x->name, target);
     } else {
         unlink(x->name);
         if (symlink(target, x->name) != 0) die_errno("cannot create symlink");
+        set_times(x->name, x->mtime, 1);
     }
 }
 
@@ -640,8 +704,28 @@ static void ext_feed(Ext *x, const unsigned char *p, size_t n) {
             memcpy(x->name + x->nhave, p + i, take);
             x->nhave += take; i += take;
             if (x->nhave < x->nlen) break;
+            x->name[x->nlen] = 0;
+            x->mode = 0; x->mtime = 0;
+            if (x->has_meta) {
+                x->field_need = 12; x->field_have = 0;
+                x->state = S_META;
+            } else if (x->type == ENT_DIR) {
+                ext_begin_entry(x);
+            } else {
+                x->field_need = 8; x->field_have = 0;
+                x->state = S_SIZE;
+            }
+            break;
+        }
+        case S_META: {
+            size_t take = x->field_need - x->field_have;
+            if (take > n - i) take = n - i;
+            memcpy(x->field + x->field_have, p + i, take);
+            x->field_have += take; i += take;
+            if (x->field_have < x->field_need) break;
+            x->mode = rd_u32(x->field);
+            x->mtime = (int64_t)rd_u64(x->field + 4);
             if (x->type == ENT_DIR) {
-                x->name[x->nlen] = 0;
                 ext_begin_entry(x);
             } else {
                 x->field_need = 8; x->field_have = 0;
@@ -667,6 +751,7 @@ static void ext_feed(Ext *x, const unsigned char *p, size_t n) {
             progress_add(x->prog, take);
             if (x->payload == 0) {
                 fclose(x->cur); x->cur = NULL;
+                apply_file_meta(x, x->name);
                 x->state = S_TYPE;
             }
             break;
@@ -689,6 +774,15 @@ static void ext_feed(Ext *x, const unsigned char *p, size_t n) {
 static void ext_done(Ext *x) {
     if (x->state != S_TYPE) die("corrupt archive (truncated entry)");
     if (x->cur) fclose(x->cur);
+    /* Restore directory metadata last, deepest-first, so neither child writes
+     * nor a read-only parent mode can interfere. */
+    for (size_t i = x->ndirs; i-- > 0; ) {
+        DirFix *df = &x->dirs[i];
+        if (df->mode) chmod(df->path, df->mode & 07777);
+        set_times(df->path, df->mtime, 0);
+        free(df->path);
+    }
+    free(x->dirs);
     buf_free(&x->link);
 }
 
@@ -820,7 +914,9 @@ static void cmd_decompress(const char *input, const char *password) {
     if (memcmp(hdr, CZIP_MAGIC, 4) != 0) die("not a czip file");
     off = 4;
     uint8_t fmt = hdr[off++];
-    if (fmt != CZIP_FORMAT) die("unsupported container format");
+    if (fmt < CZIP_FORMAT_MIN || fmt > CZIP_FORMAT)
+        die("unsupported container format");
+    int has_meta = (fmt >= 3);   /* format 3 added per-entry mode + mtime */
     off += 3;                              /* writer version (informational) */
     uint8_t algo = hdr[off++];
     if (algo != ALG_XCHACHA) die("unknown cipher in header");
@@ -852,7 +948,7 @@ static void cmd_decompress(const char *input, const char *password) {
     Progress prog;
     progress_init(&prog, "extracting", 0);
     Ext ext;
-    ext_init(&ext, &prog);
+    ext_init(&ext, &prog, has_meta);
 
     const unsigned char *ad = hdr;     /* bind header to the first chunk */
     size_t adlen = hdr_len;

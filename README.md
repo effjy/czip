@@ -1,12 +1,8 @@
-<div align="center">
-  
-<a href="https://github.com/effjy/czip/"><img src="titles/czip-title.svg" height="52" alt="Czip"></a>
+# czip
 
 [![Language](https://img.shields.io/badge/language-C-blue.svg)](https://github.com/effjy/czip)
 [![Crypto](https://img.shields.io/badge/crypto-XChaCha20--Poly1305-green.svg)](https://doc.libsodium.org/secret-key_cryptography/secretstream)
 [![Compression](https://img.shields.io/badge/compression-zstd-orange.svg)](https://facebook.github.io/zstd/)
-
-</div>
 
 **czip** compresses **and** authenticated-encrypts files or directories in a single
 step. It is the first archiver to combine [zstd](https://facebook.github.io/zstd/)
@@ -49,7 +45,7 @@ ciphertext is indistinguishable from random noise and cannot be compressed after
 - [Command reference](#command-reference)
 - [How it works](#how-it-works)
 - [Security notes](#security-notes)
-- [Container format](#container-format-v2)
+- [Container format](#container-format-v3)
 
 ---
 
@@ -104,7 +100,7 @@ Verify:
 
 ```sh
 czip --version
-# czip 1.1.0
+# czip 1.2.0
 # Author: Jean-Francois Lachance-Caumartin
 ```
 
@@ -310,7 +306,7 @@ so memory stays flat regardless of input size:
 > hundred KB) no matter how large the input — a single terabyte file compresses with
 > the same footprint as a single kilobyte one.
 
-## Container format (v2)
+## Container format (v3)
 
 ```
 "CZIP" | fmt(1) | version major/minor/patch(3) | algo(1)
@@ -323,6 +319,13 @@ into the first chunk as associated data. Each chunk is one piece of the
 zstd-compressed archive, sealed with libsodium's secretstream; the last chunk carries
 the FINAL tag, so truncation is detected. Split parts (`.001`, `.002`, …) are simply
 this byte stream cut at fixed offsets and concatenated back on extraction.
+
+Inside the compressed stream, each entry is `type(1) | name_len(4) | name`, then
+`mode(4) | mtime(8)`, then for files/symlinks a `payload_len(8)` and the payload.
+The `mode` and `mtime` fields are new in format 3, so file permissions (including
+the executable bit) and modification times are preserved on extraction; directory
+metadata is restored last so writing a directory's children can't clobber it.
+Format 2 archives (no per-entry metadata) are still read.
 
 ---
 
