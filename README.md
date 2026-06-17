@@ -1,4 +1,6 @@
-# czip
+<div align="center">
+
+<a href="https://github.com/effjy/czip/"><img src="titles/czip-title.svg" height="52" alt="Czip"></a>
 
 [![Language](https://img.shields.io/badge/language-C-blue.svg)](https://github.com/effjy/czip)
 [![Crypto](https://img.shields.io/badge/crypto-XChaCha20--Poly1305-green.svg)](https://doc.libsodium.org/secret-key_cryptography/secretstream)
@@ -7,6 +9,8 @@
 **czip** compresses **and** authenticated-encrypts files or directories in a single
 step. It is the first archiver to combine [zstd](https://facebook.github.io/zstd/)
 multithreaded compression with **XChaCha20-Poly1305** authenticated encryption.
+
+</div>
 
 - 🗜️ **Compression** — zstd, with worker threads scaled to your CPU core count
   automatically (just like 7-Zip).
